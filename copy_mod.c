@@ -7,8 +7,9 @@
 #include <linux/slab.h>
 #include <linux/random.h>
 #include <linux/uaccess.h>
-#include <asm/uaccess.h>
-#include <asm/i387.h>
+#include <asm/fpu/api.h>
+#include <linux/mm.h>
+#include <linux/vmalloc.h>
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("Sandesh");
@@ -77,8 +78,8 @@ rte_mov32(uint8_t *dst, const uint8_t *src)
 {
 	asm volatile("vmovdqu32 %%zmm1,%0\n\t"
 				 "vmovdqu32 %1,%%zmm1"
-		     :
-		     : "m" (src), "m" (dst));
+		     :"=m" (*dst)
+		     :"m" (*src));
 }
 
 /**
@@ -90,8 +91,8 @@ rte_mov64(uint8_t *dst, const uint8_t *src)
 {
 	asm volatile("vmovdqu64 %%zmm1,%0\n\t"
 				 "vmovdqu64 %1,%%zmm1"
-		     :
-		     : "m" (src), "m" (dst));
+		     :"=m" (*dst)
+		     :"m" (*src));
 }
 
 /**
@@ -351,6 +352,8 @@ static void perform_random_copy_avx(void)
     unsigned long i;
     u64 start_time, end_time;
 
+    pr_info("Random copy avx started \n");
+
 	if (!boot_cpu_has(X86_FEATURE_AVX512F) || !boot_cpu_has(X86_FEATURE_AVX))
 		return;
 
@@ -373,7 +376,7 @@ static void perform_random_copy_avx(void)
     // Shuffle chunk order
     for (i = num_chunks - 1; i > 0; i--)
     {
-        unsigned long j = get_random_int() % (i + 1);
+        unsigned long j = get_random_u64() % (i + 1);
         unsigned long temp = chunk_order[i];
         chunk_order[i] = chunk_order[j];
         chunk_order[j] = temp;
@@ -422,6 +425,8 @@ static void perform_random_copy_string(void)
 
     inprogress = true;
 
+    pr_info("Random copy string started \n");
+
     // Allocate array for random chunk order
     chunk_order = vmalloc(sizeof(unsigned long) * num_chunks);
     if (!chunk_order)
@@ -439,7 +444,7 @@ static void perform_random_copy_string(void)
     // Shuffle chunk order
     for (i = num_chunks - 1; i > 0; i--)
     {
-        unsigned long j = get_random_int() % (i + 1);
+        unsigned long j = get_random_u64() % (i + 1);
         unsigned long temp = chunk_order[i];
         chunk_order[i] = chunk_order[j];
         chunk_order[j] = temp;
@@ -535,10 +540,10 @@ static ssize_t custom_read(struct file *file, char __user *user_buffer, size_t c
     return greeting_length;
 }
 
-static struct file_operations proc_ops = {
-    .open = module_open,
-    .read = custom_read,
-    .write = module_write,
+const struct proc_ops proc_ops = {
+    .proc_open = module_open,
+    .proc_read = custom_read,
+    .proc_write = module_write,
 };
 
 static int __init copy_mod_init(void)
