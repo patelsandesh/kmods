@@ -16,18 +16,22 @@ MODULE_AUTHOR("Sandesh");
 MODULE_DESCRIPTION("Memory allocation and copy testing module");
 
 static struct proc_dir_entry *proc_entry;
-static unsigned long n_gb = 1; // Default 1 GB
-static unsigned long m_mb = 1; // Default 4 MB
+static unsigned long n_gb = 2;    // Default 1 GB
+static unsigned long k_kb = 1024; // Default 4 MB
 static void *array1;
 static void *array2;
 static bool arrays_allocated = false;
-static u64 last_copy_time_ns;   // Store last copy time in nanoseconds
-static u64 last_bandwidth_mbps; // Store last bandwidth in MB/s
+static u64 avx_last_copy_time_ns;   // Store last copy time in nanoseconds
+static u64 avx_last_bandwidth_mbps; // Store last bandwidth in MB/s
+
+static u64 string_last_copy_time_ns;   // Store last copy time in nanoseconds
+static u64 string_last_bandwidth_mbps; // Store last bandwidth in MB/s
+
 static bool inprogress = false;
 static bool verified = true;
 
 #define GB_TO_BYTES(x) ((unsigned long)(x) << 30)
-#define MB_TO_BYTES(x) ((unsigned long)(x) << 20)
+#define KB_TO_BYTES(x) ((unsigned long)(x) << 10)
 #define ALIGNMENT_MASK 0x3F
 
 /**
@@ -368,7 +372,7 @@ static int verify_copy(void)
 static void perform_random_copy_avx(void)
 {
     unsigned long total_size = GB_TO_BYTES(n_gb);
-    unsigned long chunk_size = MB_TO_BYTES(m_mb);
+    unsigned long chunk_size = KB_TO_BYTES(k_kb);
     unsigned long num_chunks = total_size / chunk_size;
     unsigned long *chunk_order;
     unsigned long i;
@@ -406,7 +410,6 @@ static void perform_random_copy_avx(void)
 
     // Start timing
     start_time = ktime_get_ns();
-
     // Perform copies in random order
     for (i = 0; i < num_chunks; i++)
     {
@@ -420,31 +423,32 @@ static void perform_random_copy_avx(void)
     end_time = ktime_get_ns();
 
     // Calculate time taken and bandwidth
-    last_copy_time_ns = end_time - start_time;
+    avx_last_copy_time_ns = end_time - start_time;
 
     // Calculate bandwidth in MB/s
     // total_size in bytes / time in seconds = bytes per second
     // Convert to MB/s by dividing by 1024*1024
-    last_bandwidth_mbps = (u64)total_size * 1000000000ULL / last_copy_time_ns;
-    last_bandwidth_mbps = last_bandwidth_mbps / (1024 * 1024);
+    avx_last_bandwidth_mbps = (u64)total_size * 1000000000ULL / avx_last_copy_time_ns;
+    avx_last_bandwidth_mbps = avx_last_bandwidth_mbps / (1024 * 1024);
 
     vfree(chunk_order);
     if (verify_copy() != true)
     {
         pr_info("Random copy verification failed  ns\n");
-        last_bandwidth_mbps = 99999999999;
+        avx_last_bandwidth_mbps = 99999999999;
     }
     inprogress = false;
-    pr_info("Random copy completed in %llu ns\n", last_copy_time_ns);
-    pr_info("Bandwidth: %llu MB/s\n", last_bandwidth_mbps);
+    pr_info("Random copy completed in %llu ns\n", avx_last_copy_time_ns);
+    pr_info("Bandwidth: %llu MB/s\n", avx_last_bandwidth_mbps);
 }
 
 static void perform_random_copy_string(void)
 {
     unsigned long total_size = GB_TO_BYTES(n_gb);
-    unsigned long chunk_size = MB_TO_BYTES(m_mb);
+    unsigned long chunk_size = KB_TO_BYTES(k_kb);
     unsigned long num_chunks = total_size / chunk_size;
     unsigned long *chunk_order;
+
     unsigned long i;
     u64 start_time, end_time;
 
@@ -490,30 +494,30 @@ static void perform_random_copy_string(void)
     end_time = ktime_get_ns();
 
     // Calculate time taken and bandwidth
-    last_copy_time_ns = end_time - start_time;
+    string_last_copy_time_ns = end_time - start_time;
 
     // Calculate bandwidth in MB/s
     // total_size in bytes / time in seconds = bytes per second
     // Convert to MB/s by dividing by 1024*1024
-    last_bandwidth_mbps = (u64)total_size * 1000000000ULL / last_copy_time_ns;
-    last_bandwidth_mbps = last_bandwidth_mbps / (1024 * 1024);
+    string_last_bandwidth_mbps = (u64)total_size * 1000000000ULL / string_last_copy_time_ns;
+    string_last_bandwidth_mbps = string_last_bandwidth_mbps / (1024 * 1024);
 
     vfree(chunk_order);
     if (verify_copy() != true)
     {
         pr_info("Random copy verification failed  ns\n");
-        last_bandwidth_mbps = 99999999999;
+        string_last_bandwidth_mbps = 99999999999;
     }
     inprogress = false;
-    pr_info("Random copy completed in %llu ns\n", last_copy_time_ns);
-    pr_info("Bandwidth: %llu MB/s\n", last_bandwidth_mbps);
+    pr_info("Random copy completed in %llu ns\n", string_last_copy_time_ns);
+    pr_info("Bandwidth: %llu MB/s\n", string_last_bandwidth_mbps);
 }
 
 static ssize_t module_write(struct file *file, const char __user *buffer,
                             size_t count, loff_t *data)
 {
     char kbuf[32];
-    unsigned long new_n, new_m;
+    unsigned long new_n, new_k;
 
     if (count > sizeof(kbuf) - 1)
         return -EINVAL;
@@ -523,18 +527,22 @@ static ssize_t module_write(struct file *file, const char __user *buffer,
 
     kbuf[count] = '\0';
 
-    if (sscanf(kbuf, "%lu %lu", &new_n, &new_m) != 2)
+    if (sscanf(kbuf, "%lu %lu", &new_n, &new_k) != 2)
         return -EINVAL;
 
-    if (new_n == 0 || new_m == 0)
+    if (new_n == 0 || new_k == 0)
         return -EINVAL;
 
-    if (new_m > new_n * 1024) // m_mb shouldn't be larger than n_gb in MB
+    if (new_k > new_n * 1024 * 1024) // k_kb shouldn't be larger than n_gb in KB
         return -EINVAL;
 
     n_gb = new_n;
-    m_mb = new_m;
+    k_kb = new_k;
 
+    if (allocate_and_initialize_arrays() == 0)
+    {
+        perform_random_copy_avx();
+    }
     if (allocate_and_initialize_arrays() == 0)
     {
         perform_random_copy_string();
@@ -547,7 +555,7 @@ static int module_show(struct seq_file *m, void *v)
 {
     seq_printf(m, "Current settings:\n");
     seq_printf(m, "Array size (n): %lu GB\n", n_gb);
-    seq_printf(m, "Chunk size (m): %lu MB\n", m_mb);
+    seq_printf(m, "Chunk size (m): %lu MB\n", k_kb);
     seq_printf(m, "Arrays allocated: %s\n", arrays_allocated ? "yes" : "no");
     return 0;
 }
@@ -564,7 +572,12 @@ static ssize_t custom_read(struct file *file, char __user *user_buffer, size_t c
     char *greeting = vmalloc(greeting_length);
     if (*offset > 0)
         return 0;
-    snprintf(greeting, greeting_length, "In progress: %s, Verified: %s Time ms %llu, Bandwidth MBps %llu\n", inprogress ? "yes" : "no", verified ? "yes" : "no", last_copy_time_ns / 1000000, last_bandwidth_mbps);
+    snprintf(greeting, greeting_length, "In progress: %s, Verified: %s \n"
+                                        "AVX: Time ms %llu, Bandwidth MBps %llu\n"
+                                        "String: Time ms %llu, Bandwidth MBps %llu\n",
+             inprogress ? "yes" : "no", verified ? "yes" : "no",
+             avx_last_copy_time_ns / 1000000, avx_last_bandwidth_mbps,
+             string_last_copy_time_ns / 1000000, string_last_bandwidth_mbps);
     copy_to_user(user_buffer, greeting, greeting_length);
     *offset = greeting_length;
     return greeting_length;
@@ -589,6 +602,11 @@ static int __init copy_mod_init(void)
     {
         perform_random_copy_avx();
     }
+    if (allocate_and_initialize_arrays() == 0)
+    {
+        perform_random_copy_string();
+    }
+
     pr_info("Memory copy module loaded\n");
     return 0;
 }
