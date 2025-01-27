@@ -1,31 +1,20 @@
-#include <linux/compiler.h>
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/init.h>
-#include <linux/proc_fs.h>
-#include <linux/seq_file.h>
-#include <linux/slab.h>
-#include <linux/random.h>
-#include <linux/uaccess.h>
-#include <asm/fpu/api.h>
-#include <linux/mm.h>
-#include <linux/vmalloc.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdbool.h>
+#include <time.h>
+#include <string.h>
 
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("Sandesh");
-MODULE_DESCRIPTION("Memory allocation and copy testing module");
-
-static struct proc_dir_entry *proc_entry;
 static unsigned long n_gb = 2;  // Default 1 GB
 static unsigned long k_kb = 16; // Default 4 MB
 static void *array1;
 static void *array2;
 static bool arrays_allocated = false;
-static u64 avx_last_copy_time_ns;   // Store last copy time in nanoseconds
-static u64 avx_last_bandwidth_mbps; // Store last bandwidth in MB/s
+static unsigned long avx_last_copy_time_ns;   // Store last copy time in nanoseconds
+static unsigned long avx_last_bandwidth_mbps; // Store last bandwidth in MB/s
 
-static u64 string_last_copy_time_ns;   // Store last copy time in nanoseconds
-static u64 string_last_bandwidth_mbps; // Store last bandwidth in MB/s
+static unsigned long string_last_copy_time_ns;   // Store last copy time in nanoseconds
+static unsigned long string_last_bandwidth_mbps; // Store last bandwidth in MB/s
 
 static bool inprogress = false;
 static bool verified = true;
@@ -59,7 +48,7 @@ rte_mov15_or_less(void *dst, const void *src, size_t n)
      * Use the following structs to avoid violating C standard
      * alignment requirements and to avoid strict aliasing bugs
      */
-    copy_user_enhanced_fast_string(dst, src, n);
+    memcpy(dst, src, n);
     return dst;
 }
 
@@ -70,7 +59,7 @@ rte_mov15_or_less(void *dst, const void *src, size_t n)
 static inline void
 rte_mov16(uint8_t *dst, const uint8_t *src)
 {
-    copy_user_enhanced_fast_string(dst, src, 16);
+    memcpy(dst, src, 16);
 }
 
 /**
@@ -93,11 +82,14 @@ rte_mov32(uint8_t *dst, const uint8_t *src)
 static inline void
 rte_mov64(uint8_t *dst, const uint8_t *src)
 {
-    asm volatile("vmovdqu64 %1,%%zmm1\n\t"
-                 "vmovdqu64 %%zmm1,%0\n\t"
+    // asm volatile("vmovdqu64 %1,%%zmm1\n\t"
+    //              "vmovdqu64 %%zmm1,%0\n\t"
 
-                 : "=m"(dst)
-                 : "m"(*src));
+    //              : "=m"(dst)
+    //              : "m"(*src));
+
+    memcpy(dst, src, 64);
+    // check why assembly gives segfault?
 }
 
 /**
@@ -171,107 +163,69 @@ rte_mov128blocks(uint8_t *dst, const uint8_t *src, size_t n)
  * locations should not overlap.
  */
 static inline void
-rte_mov512blocks(uint8_t *dst, const uint8_t *src, size_t n)
+rte_mov256blocks(uint8_t *dst, const uint8_t *src, size_t n)
 {
 
-    while (n >= 512 + 512 * 2)
+    while (n >= 256 + 256 * 2)
     {
-        __builtin_prefetch(dst + 1024 + 64 * 0, 0, 2);
-        __builtin_prefetch(dst + 1024 + 64 * 1, 0, 2);
-        __builtin_prefetch(dst + 1024 + 64 * 2, 0, 2);
-        __builtin_prefetch(dst + 1024 + 64 * 3, 0, 2);
-        __builtin_prefetch(dst + 1024 + 64 * 4, 0, 2);
-        __builtin_prefetch(dst + 1024 + 64 * 5, 0, 2);
-        __builtin_prefetch(dst + 1024 + 64 * 6, 0, 2);
-        __builtin_prefetch(dst + 1024 + 64 * 7, 0, 2);
-
-        asm volatile("vmovdqa64 %8,%%zmm0\n\t"
-                     "vmovdqa64 %9,%%zmm1\n\t"
-                     "vmovdqa64 %10,%%zmm2\n\t"
-                     "vmovdqa64 %11,%%zmm3\n\t"
-                     "vmovdqa64 %12,%%zmm4\n\t"
-                     "vmovdqa64 %13,%%zmm5\n\t"
-                     "vmovdqa64 %14,%%zmm6\n\t"
-                     "vmovdqa64 %15,%%zmm7\n\t"
+        __builtin_prefetch(dst + 512 + 64 * 0, 0, 2);
+        __builtin_prefetch(dst + 512 + 64 * 1, 0, 2);
+        __builtin_prefetch(dst + 512 + 64 * 2, 0, 2);
+        __builtin_prefetch(dst + 512 + 64 * 3, 0, 2);
+        asm volatile("vmovdqa64 %4,%%zmm0\n\t"
+                     "vmovdqa64 %5,%%zmm1\n\t"
+                     "vmovdqa64 %6,%%zmm2\n\t"
+                     "vmovdqa64 %7,%%zmm3\n\t"
 
                      "vmovdqa64 %%zmm0,%0\n\t"
                      "vmovdqa64 %%zmm1,%1\n\t"
                      "vmovdqa64 %%zmm2,%2\n\t"
                      "vmovdqa64 %%zmm3,%3\n\t"
-                     "vmovdqa64 %%zmm4,%4\n\t"
-                     "vmovdqa64 %%zmm5,%5\n\t"
-                     "vmovdqa64 %%zmm6,%6\n\t"
-                     "vmovdqa64 %%zmm7,%7\n\t"
 
                      : "=m"(dst[0 * 64]), "=m"(dst[1 * 64]),
-                       "=m"(dst[2 * 64]), "=m"(dst[3 * 64]),
-                       "=m"(dst[4 * 64]), "=m"(dst[5 * 64]),
-                       "=m"(dst[6 * 64]), "=m"(dst[7 * 64])
+                       "=m"(dst[2 * 64]), "=m"(dst[3 * 64])
                      : "m"(*(src + 0 * 64)), "m"(*(src + 1 * 64)),
-                       "m"(*(src + 2 * 64)), "m"(*(src + 3 * 64)),
-                       "m"(*(src + 4 * 64)), "m"(*(src + 5 * 64)),
-                       "m"(*(src + 6 * 64)), "m"(*(src + 7 * 64)));
-        n -= 512;
-        src = src + 512;
-        dst = dst + 512;
+                       "m"(*(src + 2 * 64)), "m"(*(src + 3 * 64)));
+        n -= 256;
+        src = src + 256;
+        dst = dst + 256;
     }
 
-    asm volatile("vmovdqa64 %8,%%zmm0\n\t"
-                 "vmovdqa64 %9,%%zmm1\n\t"
-                 "vmovdqa64 %10,%%zmm2\n\t"
-                 "vmovdqa64 %11,%%zmm3\n\t"
-                 "vmovdqa64 %12,%%zmm4\n\t"
-                 "vmovdqa64 %13,%%zmm5\n\t"
-                 "vmovdqa64 %14,%%zmm6\n\t"
-                 "vmovdqa64 %15,%%zmm7\n\t"
+    asm volatile("vmovdqa64 %4,%%zmm0\n\t"
+                 "vmovdqa64 %5,%%zmm1\n\t"
+                 "vmovdqa64 %6,%%zmm2\n\t"
+                 "vmovdqa64 %7,%%zmm3\n\t"
 
                  "vmovdqa64 %%zmm0,%0\n\t"
                  "vmovdqa64 %%zmm1,%1\n\t"
                  "vmovdqa64 %%zmm2,%2\n\t"
                  "vmovdqa64 %%zmm3,%3\n\t"
-                 "vmovdqa64 %%zmm4,%4\n\t"
-                 "vmovdqa64 %%zmm5,%5\n\t"
-                 "vmovdqa64 %%zmm6,%6\n\t"
-                 "vmovdqa64 %%zmm7,%7\n\t"
 
                  : "=m"(dst[0 * 64]), "=m"(dst[1 * 64]),
-                   "=m"(dst[2 * 64]), "=m"(dst[3 * 64]),
-                   "=m"(dst[4 * 64]), "=m"(dst[5 * 64]),
-                   "=m"(dst[6 * 64]), "=m"(dst[7 * 64])
+                   "=m"(dst[2 * 64]), "=m"(dst[3 * 64])
                  : "m"(*(src + 0 * 64)), "m"(*(src + 1 * 64)),
-                   "m"(*(src + 2 * 64)), "m"(*(src + 3 * 64)),
-                   "m"(*(src + 4 * 64)), "m"(*(src + 5 * 64)),
-                   "m"(*(src + 6 * 64)), "m"(*(src + 7 * 64)));
-    n -= 512;
-    src = src + 512;
-    dst = dst + 512;
+                   "m"(*(src + 2 * 64)), "m"(*(src + 3 * 64)));
+    n -= 256;
+    src = src + 256;
+    dst = dst + 256;
 
-    asm volatile("vmovdqa64 %8,%%zmm0\n\t"
-                 "vmovdqa64 %9,%%zmm1\n\t"
-                 "vmovdqa64 %10,%%zmm2\n\t"
-                 "vmovdqa64 %11,%%zmm3\n\t"
-                 "vmovdqa64 %12,%%zmm4\n\t"
-                 "vmovdqa64 %13,%%zmm5\n\t"
-                 "vmovdqa64 %14,%%zmm6\n\t"
-                 "vmovdqa64 %15,%%zmm7\n\t"
+    asm volatile("vmovdqa64 %4,%%zmm0\n\t"
+                 "vmovdqa64 %5,%%zmm1\n\t"
+                 "vmovdqa64 %6,%%zmm2\n\t"
+                 "vmovdqa64 %7,%%zmm3\n\t"
 
                  "vmovdqa64 %%zmm0,%0\n\t"
                  "vmovdqa64 %%zmm1,%1\n\t"
                  "vmovdqa64 %%zmm2,%2\n\t"
                  "vmovdqa64 %%zmm3,%3\n\t"
-                 "vmovdqa64 %%zmm4,%4\n\t"
-                 "vmovdqa64 %%zmm5,%5\n\t"
-                 "vmovdqa64 %%zmm6,%6\n\t"
-                 "vmovdqa64 %%zmm7,%7\n\t"
 
                  : "=m"(dst[0 * 64]), "=m"(dst[1 * 64]),
-                   "=m"(dst[2 * 64]), "=m"(dst[3 * 64]),
-                   "=m"(dst[4 * 64]), "=m"(dst[5 * 64]),
-                   "=m"(dst[6 * 64]), "=m"(dst[7 * 64])
+                   "=m"(dst[2 * 64]), "=m"(dst[3 * 64])
                  : "m"(*(src + 0 * 64)), "m"(*(src + 1 * 64)),
-                   "m"(*(src + 2 * 64)), "m"(*(src + 3 * 64)),
-                   "m"(*(src + 4 * 64)), "m"(*(src + 5 * 64)),
-                   "m"(*(src + 6 * 64)), "m"(*(src + 7 * 64)));
+                   "m"(*(src + 2 * 64)), "m"(*(src + 3 * 64)));
+    n -= 256;
+    src = src + 256;
+    dst = dst + 256;
 }
 
 static inline void *
@@ -354,7 +308,7 @@ rte_memcpy_generic(void *dst, const void *src, size_t n)
      * Use copy block function for better instruction order control,
      * which is important when load is unaligned.
      */
-    rte_mov512blocks((uint8_t *)dst, (const uint8_t *)src, n);
+    rte_mov256blocks((uint8_t *)dst, (const uint8_t *)src, n);
     bits = n;
     n = n & 511;
     bits -= n;
@@ -392,10 +346,10 @@ static void cleanup_arrays(void)
 {
     if (arrays_allocated)
     {
-        vfree(array1);
-        vfree(array2);
+        free(array1);
+        free(array2);
         arrays_allocated = false;
-        pr_info("Arrays freed\n");
+        printf("Arrays freed\n");
     }
 }
 
@@ -405,19 +359,19 @@ static int allocate_and_initialize_arrays(void)
 
     cleanup_arrays(); // Clean up any existing arrays
 
-    array1 = vmalloc(size);
+    array1 = malloc(size);
     if (!array1)
     {
-        pr_err("Failed to allocate array1\n");
-        return -ENOMEM;
+        printf("Failed to allocate array1\n");
+        return -1;
     }
 
-    array2 = vmalloc(size);
+    array2 = malloc(size);
     if (!array2)
     {
-        pr_err("Failed to allocate array2\n");
-        vfree(array1);
-        return -ENOMEM;
+        printf("Failed to allocate array2\n");
+        free(array1);
+        return -1;
     }
 
     // Initialize array1 with 1s
@@ -427,7 +381,7 @@ static int allocate_and_initialize_arrays(void)
     memset(array2, 2, size);
 
     arrays_allocated = true;
-    pr_info("Arrays allocated and initialized: %lu GB each\n", n_gb);
+    printf("Arrays allocated and initialized: %lu GB each\n", n_gb);
     return 0;
 }
 
@@ -445,13 +399,13 @@ static int verify_copy(void)
     {
         if (((char *)array1)[i] != ((char *)array2)[i])
         {
-            pr_err("Verification failed at offset %lu, total size %lu, a1 %d a2 %d\n", i, size, ((char *)array1)[i], ((char *)array2)[i]);
+            printf("Verification failed at offset %lu, total size %lu, a1 %d a2 %d\n", i, size, ((char *)array1)[i], ((char *)array2)[i]);
             verified = false;
             return verified;
         }
     }
 
-    pr_info("Verification successful\n");
+    printf("Verification successful\n");
     verified = true;
     return verified;
 }
@@ -463,20 +417,18 @@ static void perform_random_copy_avx(void)
     unsigned long num_chunks = total_size / chunk_size;
     unsigned long *chunk_order;
     unsigned long i;
-    u64 start_time, end_time;
+    struct timespec t1;
+    unsigned long start_time, end_time;
 
-    pr_info("Random copy avx started \n");
-
-    if (!boot_cpu_has(X86_FEATURE_AVX512F) || !boot_cpu_has(X86_FEATURE_AVX))
-        return;
+    printf("Random copy avx started \n");
 
     inprogress = true;
 
     // Allocate array for random chunk order
-    chunk_order = vmalloc(sizeof(unsigned long) * num_chunks);
+    chunk_order = malloc(sizeof(unsigned long) * num_chunks);
     if (!chunk_order)
     {
-        pr_err("Failed to allocate chunk order array\n");
+        printf("Failed to allocate chunk order array\n");
         return;
     }
 
@@ -489,25 +441,25 @@ static void perform_random_copy_avx(void)
     // Shuffle chunk order
     for (i = num_chunks - 1; i > 0; i--)
     {
-        unsigned long j = get_random_u64() % (i + 1);
+        unsigned long j = rand() % (i + 1);
         unsigned long temp = chunk_order[i];
         chunk_order[i] = chunk_order[j];
         chunk_order[j] = temp;
     }
 
     // Start timing
-    start_time = ktime_get_ns();
+    clock_gettime(CLOCK_REALTIME, &t1);
+    start_time = t1.tv_sec * 1000000000 + t1.tv_nsec;
     // Perform copies in random order
     for (i = 0; i < num_chunks; i++)
     {
         unsigned long offset = chunk_order[i] * chunk_size;
-        kernel_fpu_begin();
         rte_memcpy(array2 + offset, array1 + offset, chunk_size);
-        kernel_fpu_end();
-        pr_debug("Copied chunk %lu/%lu\n", i + 1, num_chunks);
     }
     // End timing
-    end_time = ktime_get_ns();
+    clock_gettime(CLOCK_REALTIME, &t1);
+    end_time = t1.tv_sec * 1000000000 + t1.tv_nsec;
+    ;
 
     // Calculate time taken and bandwidth
     avx_last_copy_time_ns = end_time - start_time;
@@ -515,17 +467,17 @@ static void perform_random_copy_avx(void)
     // Calculate bandwidth in MB/s
     // total_size in bytes / time in seconds = bytes per second
     // Convert to MB/s by dividing by 1024*1024
-    avx_last_bandwidth_mbps = (u64)total_size * 1000000000ULL / avx_last_copy_time_ns;
+    avx_last_bandwidth_mbps = (unsigned long)total_size * 1000000000ULL / avx_last_copy_time_ns;
     avx_last_bandwidth_mbps = avx_last_bandwidth_mbps / (1024 * 1024);
 
-    vfree(chunk_order);
+    free(chunk_order);
     if (verify_copy() != true)
     {
-        pr_info("Random copy verification failed  ns\n");
-        avx_last_bandwidth_mbps = 99999999999;
+        printf("Random copy verification failed  ns\n");
+        // avx_last_bandwidth_mbps = 99999999999;
     }
     inprogress = false;
-    pr_info("Copy_result \tAVX\t Chunk_size %llu KB\t Time: %llu ms\t Bandwidth: %llu MB/s\n", k_kb, avx_last_copy_time_ns / 1000000, avx_last_bandwidth_mbps);
+    printf("Copy_result \tAVX\t Chunk_size %llu KB\t Time: %llu ms\t Bandwidth: %llu MB/s\n", k_kb, avx_last_copy_time_ns / 1000000, avx_last_bandwidth_mbps);
 }
 
 static void perform_random_copy_string(void)
@@ -536,17 +488,18 @@ static void perform_random_copy_string(void)
     unsigned long *chunk_order;
 
     unsigned long i;
-    u64 start_time, end_time;
+    unsigned long start_time, end_time;
+    struct timespec t1;
 
     inprogress = true;
 
-    pr_info("Random copy string started \n");
+    printf("Random copy string started \n");
 
     // Allocate array for random chunk order
-    chunk_order = vmalloc(sizeof(unsigned long) * num_chunks);
+    chunk_order = malloc(sizeof(unsigned long) * num_chunks);
     if (!chunk_order)
     {
-        pr_err("Failed to allocate chunk order array\n");
+        printf("Failed to allocate chunk order array\n");
         return;
     }
 
@@ -559,25 +512,27 @@ static void perform_random_copy_string(void)
     // Shuffle chunk order
     for (i = num_chunks - 1; i > 0; i--)
     {
-        unsigned long j = get_random_u64() % (i + 1);
+        unsigned long j = rand() % (i + 1);
         unsigned long temp = chunk_order[i];
         chunk_order[i] = chunk_order[j];
         chunk_order[j] = temp;
     }
 
     // Start timing
-    start_time = ktime_get_ns();
+    clock_gettime(CLOCK_REALTIME, &t1);
+    start_time = t1.tv_sec * 1000000000 + t1.tv_nsec;
 
     // Perform copies in random order
     for (i = 0; i < num_chunks; i++)
     {
         unsigned long offset = chunk_order[i] * chunk_size;
-        copy_user_enhanced_fast_string(array2 + offset, array1 + offset, chunk_size);
-        pr_debug("Copied chunk %lu/%lu\n", i + 1, num_chunks);
+        memcpy(array2 + offset, array1 + offset, chunk_size);
     }
 
     // End timing
-    end_time = ktime_get_ns();
+    clock_gettime(CLOCK_REALTIME, &t1);
+    end_time = t1.tv_sec * 1000000000 + t1.tv_nsec;
+    ;
 
     // Calculate time taken and bandwidth
     string_last_copy_time_ns = end_time - start_time;
@@ -585,106 +540,24 @@ static void perform_random_copy_string(void)
     // Calculate bandwidth in MB/s
     // total_size in bytes / time in seconds = bytes per second
     // Convert to MB/s by dividing by 1024*1024
-    string_last_bandwidth_mbps = (u64)total_size * 1000000000ULL / string_last_copy_time_ns;
+    string_last_bandwidth_mbps = (unsigned long)total_size * 1000000000ULL / string_last_copy_time_ns;
     string_last_bandwidth_mbps = string_last_bandwidth_mbps / (1024 * 1024);
 
-    vfree(chunk_order);
+    free(chunk_order);
     if (verify_copy() != true)
     {
-        pr_info("Random copy verification failed  ns\n");
-        string_last_bandwidth_mbps = 99999999999;
+        printf("Random copy verification failed  ns\n");
+        // string_last_bandwidth_mbps = 99999999999;
     }
     inprogress = false;
-    pr_info("Copy_result \tSTR\t Chunk_size %llu KB\t Time: %llu ms\t Bandwidth: %llu MB/s\n", k_kb, string_last_copy_time_ns / 1000000, string_last_bandwidth_mbps);
+    printf("Copy_result \tSTR\t Chunk_size %llu KB\t Time: %llu ms\t Bandwidth: %llu MB/s\n", k_kb, string_last_copy_time_ns / 1000000, string_last_bandwidth_mbps);
 }
 
-static ssize_t module_write(struct file *file, const char __user *buffer,
-                            size_t count, loff_t *data)
-{
-    char kbuf[32];
-    unsigned long new_n, new_k;
-
-    if (count > sizeof(kbuf) - 1)
-        return -EINVAL;
-
-    if (copy_from_user(kbuf, buffer, count))
-        return -EFAULT;
-
-    kbuf[count] = '\0';
-
-    if (sscanf(kbuf, "%lu %lu", &new_n, &new_k) != 2)
-        return -EINVAL;
-
-    if (new_n == 0 || new_k == 0)
-        return -EINVAL;
-
-    if (new_k > new_n * 1024 * 1024) // k_kb shouldn't be larger than n_gb in KB
-        return -EINVAL;
-
-    n_gb = new_n;
-    k_kb = new_k;
-
-    if (allocate_and_initialize_arrays() == 0)
-    {
-        perform_random_copy_avx();
-    }
-    if (allocate_and_initialize_arrays() == 0)
-    {
-        perform_random_copy_string();
-    }
-
-    return count;
-}
-
-static int module_show(struct seq_file *m, void *v)
-{
-    seq_printf(m, "Current settings:\n");
-    seq_printf(m, "Array size (n): %lu GB\n", n_gb);
-    seq_printf(m, "Chunk size (m): %lu MB\n", k_kb);
-    seq_printf(m, "Arrays allocated: %s\n", arrays_allocated ? "yes" : "no");
-    return 0;
-}
-
-static int module_open(struct inode *inode, struct file *file)
-{
-    return single_open(file, module_show, NULL);
-}
-
-static ssize_t custom_read(struct file *file, char __user *user_buffer, size_t count, loff_t *offset)
-{
-    printk(KERN_INFO "calling our very own custom read method.");
-    int greeting_length = 128;
-    char *greeting = vmalloc(greeting_length);
-    if (*offset > 0)
-        return 0;
-    snprintf(greeting, greeting_length, "In progress: %s, Verified: %s \n"
-                                        "AVX: Time ms %llu, Bandwidth MBps %llu\n"
-                                        "String: Time ms %llu, Bandwidth MBps %llu\n",
-             inprogress ? "yes" : "no", verified ? "yes" : "no",
-             avx_last_copy_time_ns / 1000000, avx_last_bandwidth_mbps,
-             string_last_copy_time_ns / 1000000, string_last_bandwidth_mbps);
-    copy_to_user(user_buffer, greeting, greeting_length);
-    *offset = greeting_length;
-    return greeting_length;
-}
-
-const struct proc_ops proc_ops = {
-    .proc_open = module_open,
-    .proc_read = custom_read,
-    .proc_write = module_write,
-};
-
-static int __init copy_mod_init(void)
+int main(void)
 {
     unsigned long chunk_size_kb = 1;
-    pr_info("Copy_mod Memory copy module loading\n");
-    proc_entry = proc_create("memory_copy", 0666, NULL, &proc_ops);
-    if (!proc_entry)
-    {
-        pr_err("Failed to create proc entry\n");
-        return -ENOMEM;
-    }
-    for (chunk_size_kb = 1; chunk_size_kb < 1024 * 1024 * 2; chunk_size_kb *= 2)
+    printf("Copy_mod Memory copy module loading\n");
+    for (chunk_size_kb = 1; chunk_size_kb < 1024 * 8; chunk_size_kb *= 2)
     {
         k_kb = chunk_size_kb;
         if (allocate_and_initialize_arrays() == 0)
@@ -696,20 +569,13 @@ static int __init copy_mod_init(void)
             perform_random_copy_string();
         }
     }
+    printf("In progress: %s, Verified: %s \n"
+           "AVX: Time ms %llu, Bandwidth MBps %llu\n"
+           "String: Time ms %llu, Bandwidth MBps %llu\n",
+           inprogress ? "yes" : "no", verified ? "yes" : "no",
+           avx_last_copy_time_ns / 1000000, avx_last_bandwidth_mbps,
+           string_last_copy_time_ns / 1000000, string_last_bandwidth_mbps);
 
-    pr_info("Memory copy module loaded\n");
+    printf("Memory copy module loaded\n");
     return 0;
 }
-
-static void __exit copy_mod_exit(void)
-{
-    cleanup_arrays();
-    if (proc_entry)
-    {
-        proc_remove(proc_entry);
-    }
-    pr_info("Memory copy module unloaded\n");
-}
-
-module_init(copy_mod_init);
-module_exit(copy_mod_exit);
