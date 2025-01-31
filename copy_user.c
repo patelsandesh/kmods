@@ -4,6 +4,12 @@
 #include <stdbool.h>
 #include <time.h>
 #include <string.h>
+#include <immintrin.h>
+#include <sys/mman.h>
+
+#include <cstdlib>
+#include <thread>
+#include <vector>
 
 static unsigned long n_gb = 2;  // Default 1 GB
 static unsigned long k_kb = 16; // Default 4 MB
@@ -41,6 +47,127 @@ static bool verified = true;
 static inline void *
 rte_memcpy(void *dst, const void *src, size_t n);
 
+static inline void _rep_movsb(void *d, const void *s, size_t n)
+{
+    asm volatile("rep movsb"
+                 : "=D"(d), "=S"(s), "=c"(n)
+                 : "0"(d), "1"(s), "2"(n)
+                 : "memory");
+}
+
+static inline void _avx_cpy(void *d, const void *s, size_t n)
+{
+    // d, s -> 32 byte aligned
+    // n -> multiple of 32
+
+    auto *dVec = reinterpret_cast<__m256i *>(d);
+    const auto *sVec = reinterpret_cast<const __m256i *>(s);
+    size_t nVec = n / sizeof(__m256i);
+    for (; nVec > 0; nVec--, sVec++, dVec++)
+    {
+        const __m256i temp = _mm256_load_si256(sVec);
+        _mm256_store_si256(dVec, temp);
+    }
+}
+
+static inline void _avx_async_cpy(void *d, const void *s, size_t n)
+{
+    // d, s -> 32 byte aligned
+    // n -> multiple of 32
+
+    auto *dVec = reinterpret_cast<__m256i *>(d);
+    const auto *sVec = reinterpret_cast<const __m256i *>(s);
+    size_t nVec = n / sizeof(__m256i);
+    for (; nVec > 0; nVec--, sVec++, dVec++)
+    {
+        const __m256i temp = _mm256_stream_load_si256(sVec);
+        _mm256_stream_si256(dVec, temp);
+    }
+    _mm_sfence();
+}
+
+static inline void _avx_async_pf_cpy(void *d, const void *s, size_t n)
+{
+    // d, s -> 64 byte aligned
+    // n -> multiple of 64
+
+    auto *dVec = reinterpret_cast<__m256i *>(d);
+    const auto *sVec = reinterpret_cast<const __m256i *>(s);
+    size_t nVec = n / sizeof(__m256i);
+    for (; nVec > 2; nVec -= 2, sVec += 2, dVec += 2)
+    {
+        // prefetch the next iteration's data
+        // by default _mm_prefetch moves the entire cache-lint (64b)
+        _mm_prefetch(sVec + 2, _MM_HINT_T0);
+
+        _mm256_stream_si256(dVec, _mm256_load_si256(sVec));
+        _mm256_stream_si256(dVec + 1, _mm256_load_si256(sVec + 1));
+    }
+    _mm256_stream_si256(dVec, _mm256_load_si256(sVec));
+    _mm256_stream_si256(dVec + 1, _mm256_load_si256(sVec + 1));
+    _mm_sfence();
+}
+
+static inline void _avx_cpy_unroll(void *d, const void *s, size_t n)
+{
+    // d, s -> 128 byte aligned
+    // n -> multiple of 128
+
+    auto *dVec = reinterpret_cast<__m256i *>(d);
+    const auto *sVec = reinterpret_cast<const __m256i *>(s);
+    size_t nVec = n / sizeof(__m256i);
+    for (; nVec > 0; nVec -= 4, sVec += 4, dVec += 4)
+    {
+        _mm256_store_si256(dVec, _mm256_load_si256(sVec));
+        _mm256_store_si256(dVec + 1, _mm256_load_si256(sVec + 1));
+        _mm256_store_si256(dVec + 2, _mm256_load_si256(sVec + 2));
+        _mm256_store_si256(dVec + 3, _mm256_load_si256(sVec + 3));
+    }
+}
+
+static inline void _avx_async_cpy_unroll(void *d, const void *s, size_t n)
+{
+    // d, s -> 128 byte aligned
+    // n -> multiple of 128
+
+    auto *dVec = reinterpret_cast<__m256i *>(d);
+    const auto *sVec = reinterpret_cast<const __m256i *>(s);
+    size_t nVec = n / sizeof(__m256i);
+    for (; nVec > 0; nVec -= 4, sVec += 4, dVec += 4)
+    {
+        _mm256_stream_si256(dVec, _mm256_stream_load_si256(sVec));
+        _mm256_stream_si256(dVec + 1, _mm256_stream_load_si256(sVec + 1));
+        _mm256_stream_si256(dVec + 2, _mm256_stream_load_si256(sVec + 2));
+        _mm256_stream_si256(dVec + 3, _mm256_stream_load_si256(sVec + 3));
+    }
+    _mm_sfence();
+}
+
+static inline void _avx_async_pf_cpy_unroll(void *d, const void *s, size_t n)
+{
+    // d, s -> 128 byte aligned
+    // n -> multiple of 128
+
+    auto *dVec = reinterpret_cast<__m256i *>(d);
+    const auto *sVec = reinterpret_cast<const __m256i *>(s);
+    size_t nVec = n / sizeof(__m256i);
+    for (; nVec > 4; nVec -= 4, sVec += 4, dVec += 4)
+    {
+        // prefetch data for next iteration
+        _mm_prefetch(sVec + 4, _MM_HINT_T0);
+        _mm_prefetch(sVec + 6, _MM_HINT_T0);
+        _mm256_stream_si256(dVec, _mm256_load_si256(sVec));
+        _mm256_stream_si256(dVec + 1, _mm256_load_si256(sVec + 1));
+        _mm256_stream_si256(dVec + 2, _mm256_load_si256(sVec + 2));
+        _mm256_stream_si256(dVec + 3, _mm256_load_si256(sVec + 3));
+    }
+    _mm256_stream_si256(dVec, _mm256_load_si256(sVec));
+    _mm256_stream_si256(dVec + 1, _mm256_load_si256(sVec + 1));
+    _mm256_stream_si256(dVec + 2, _mm256_load_si256(sVec + 2));
+    _mm256_stream_si256(dVec + 3, _mm256_load_si256(sVec + 3));
+    _mm_sfence();
+}
+
 static inline void *
 rte_mov15_or_less(void *dst, const void *src, size_t n)
 {
@@ -71,6 +198,7 @@ rte_mov32(uint8_t *dst, const uint8_t *src)
 {
     asm volatile("vmovdqu32 %1,%%zmm1\n\t"
                  "vmovdqu32 %%zmm1,%0\n\t"
+                 "sfence"
                  : "=m"(dst)
                  : "m"(*src));
 }
@@ -131,6 +259,7 @@ rte_mov128blocks(uint8_t *dst, const uint8_t *src, size_t n)
                      "vmovdqa64 %3,%%zmm1\n\t"
                      "vmovdqa64 %%zmm0,%0\n\t"
                      "vmovdqa64 %%zmm1,%1\n\t"
+                     "sfence"
                      : "=m"((dst[0 * 64])), "=m"((dst[1 * 64]))
                      : "m"(*(src + 0 * 64)), "m"(*(src + 1 * 64)));
         n -= 128;
@@ -141,6 +270,7 @@ rte_mov128blocks(uint8_t *dst, const uint8_t *src, size_t n)
                  "vmovdqa64 %3,%%zmm1\n\t"
                  "vmovdqa64 %%zmm0,%0\n\t"
                  "vmovdqa64 %%zmm1,%1\n\t"
+                 "sfence"
                  : "=m"((dst[0 * 64])), "=m"((dst[1 * 64]))
                  : "m"(*(src + 0 * 64)), "m"(*(src + 1 * 64)));
     n -= 128;
@@ -151,6 +281,7 @@ rte_mov128blocks(uint8_t *dst, const uint8_t *src, size_t n)
                  "vmovdqa64 %3,%%zmm1\n\t"
                  "vmovdqa64 %%zmm0,%0\n\t"
                  "vmovdqa64 %%zmm1,%1\n\t"
+                 "sfence"
                  : "=m"((dst[0 * 64])), "=m"((dst[1 * 64]))
                  : "m"(*(src + 0 * 64)), "m"(*(src + 1 * 64)));
     n -= 128;
@@ -181,6 +312,7 @@ rte_mov256blocks(uint8_t *dst, const uint8_t *src, size_t n)
                      "vmovdqa64 %%zmm1,%1\n\t"
                      "vmovdqa64 %%zmm2,%2\n\t"
                      "vmovdqa64 %%zmm3,%3\n\t"
+                     "sfence"
 
                      : "=m"(dst[0 * 64]), "=m"(dst[1 * 64]),
                        "=m"(dst[2 * 64]), "=m"(dst[3 * 64])
@@ -200,6 +332,7 @@ rte_mov256blocks(uint8_t *dst, const uint8_t *src, size_t n)
                  "vmovdqa64 %%zmm1,%1\n\t"
                  "vmovdqa64 %%zmm2,%2\n\t"
                  "vmovdqa64 %%zmm3,%3\n\t"
+                 "sfence"
 
                  : "=m"(dst[0 * 64]), "=m"(dst[1 * 64]),
                    "=m"(dst[2 * 64]), "=m"(dst[3 * 64])
@@ -218,6 +351,7 @@ rte_mov256blocks(uint8_t *dst, const uint8_t *src, size_t n)
                  "vmovdqa64 %%zmm1,%1\n\t"
                  "vmovdqa64 %%zmm2,%2\n\t"
                  "vmovdqa64 %%zmm3,%3\n\t"
+                 "sfence"
 
                  : "=m"(dst[0 * 64]), "=m"(dst[1 * 64]),
                    "=m"(dst[2 * 64]), "=m"(dst[3 * 64])
@@ -342,12 +476,42 @@ rte_memcpy(void *dst, const void *src, size_t n)
     return rte_memcpy_generic(dst, src, n);
 }
 
+static void *allocate(size_t size)
+{
+    void *ptr = mmap(
+        nullptr,                     // Let OS choose the address
+        size,                        // Size of mapping
+        PROT_READ | PROT_WRITE,      // Read and write permissions
+        MAP_PRIVATE | MAP_ANONYMOUS, // Private mapping, not backed by file
+        -1,                          // File descriptor (not used with MAP_ANONYMOUS)
+        0                            // Offset (not used with MAP_ANONYMOUS)
+    );
+
+    if (ptr == MAP_FAILED)
+    {
+        printf("failed to allocate\n");
+        exit(1);
+    }
+
+    return ptr;
+}
+
+static void deallocate(void *ptr, size_t size)
+{
+    if (munmap(ptr, size) == -1)
+    {
+        printf("failed to free\n");
+        exit(1);
+    }
+}
+
 static void cleanup_arrays(void)
 {
+    unsigned long size = GB_TO_BYTES(n_gb);
     if (arrays_allocated)
     {
-        free(array1);
-        free(array2);
+        deallocate(array1, size);
+        deallocate(array2, size);
         arrays_allocated = false;
         printf("Arrays freed\n");
     }
@@ -359,14 +523,14 @@ static int allocate_and_initialize_arrays(void)
 
     cleanup_arrays(); // Clean up any existing arrays
 
-    array1 = malloc(size);
+    array1 = allocate(size);
     if (!array1)
     {
         printf("Failed to allocate array1\n");
         return -1;
     }
 
-    array2 = malloc(size);
+    array2 = allocate(size);
     if (!array2)
     {
         printf("Failed to allocate array2\n");
@@ -389,11 +553,6 @@ static int verify_copy(void)
 {
     unsigned long size = GB_TO_BYTES(n_gb);
     unsigned long i;
-
-    if (verified != true)
-    {
-        return false;
-    }
 
     for (i = 0; i < size; i++)
     {
@@ -420,12 +579,12 @@ static void perform_random_copy_avx(void)
     struct timespec t1;
     unsigned long start_time, end_time;
 
-    printf("Random copy avx started \n");
+    printf("Random copy started \n");
 
     inprogress = true;
 
     // Allocate array for random chunk order
-    chunk_order = malloc(sizeof(unsigned long) * num_chunks);
+    chunk_order = (unsigned long *)malloc(sizeof(unsigned long) * num_chunks);
     if (!chunk_order)
     {
         printf("Failed to allocate chunk order array\n");
@@ -477,10 +636,430 @@ static void perform_random_copy_avx(void)
         // avx_last_bandwidth_mbps = 99999999999;
     }
     inprogress = false;
-    printf("Copy_result \tAVX\t Chunk_size %llu KB\t Time: %llu ms\t Bandwidth: %llu MB/s\n", k_kb, avx_last_copy_time_ns / 1000000, avx_last_bandwidth_mbps);
+    printf("Copy_result \tAVX-asm\t Chunk_size %llu KB\t Time: %llu ms\t Bandwidth: %llu MB/s\n", k_kb, avx_last_copy_time_ns / 1000000, avx_last_bandwidth_mbps);
 }
 
-static void perform_random_copy_string(void)
+static void perform_random_copy_rep_movsb(void)
+{
+    unsigned long total_size = GB_TO_BYTES(n_gb);
+    unsigned long chunk_size = KB_TO_BYTES(k_kb);
+    unsigned long num_chunks = total_size / chunk_size;
+    unsigned long *chunk_order;
+    unsigned long i;
+    struct timespec t1;
+    unsigned long start_time, end_time;
+
+    printf("Random copy started \n");
+
+    inprogress = true;
+
+    // Allocate array for random chunk order
+    chunk_order = (unsigned long *)malloc(sizeof(unsigned long) * num_chunks);
+    if (!chunk_order)
+    {
+        printf("Failed to allocate chunk order array\n");
+        return;
+    }
+
+    // Initialize chunk order
+    for (i = 0; i < num_chunks; i++)
+    {
+        chunk_order[i] = i;
+    }
+
+    // Shuffle chunk order
+    for (i = num_chunks - 1; i > 0; i--)
+    {
+        unsigned long j = rand() % (i + 1);
+        unsigned long temp = chunk_order[i];
+        chunk_order[i] = chunk_order[j];
+        chunk_order[j] = temp;
+    }
+
+    // Start timing
+    clock_gettime(CLOCK_REALTIME, &t1);
+    start_time = t1.tv_sec * 1000000000 + t1.tv_nsec;
+    // Perform copies in random order
+    for (i = 0; i < num_chunks; i++)
+    {
+        unsigned long offset = chunk_order[i] * chunk_size;
+        _rep_movsb(array2 + offset, array1 + offset, chunk_size);
+    }
+    // End timing
+    clock_gettime(CLOCK_REALTIME, &t1);
+    end_time = t1.tv_sec * 1000000000 + t1.tv_nsec;
+    ;
+
+    // Calculate time taken and bandwidth
+    avx_last_copy_time_ns = end_time - start_time;
+
+    // Calculate bandwidth in MB/s
+    // total_size in bytes / time in seconds = bytes per second
+    // Convert to MB/s by dividing by 1024*1024
+    avx_last_bandwidth_mbps = (unsigned long)total_size * 1000000000ULL / avx_last_copy_time_ns;
+    avx_last_bandwidth_mbps = avx_last_bandwidth_mbps / (1024 * 1024);
+
+    free(chunk_order);
+    if (verify_copy() != true)
+    {
+        printf("Random copy verification failed  ns\n");
+        // avx_last_bandwidth_mbps = 99999999999;
+    }
+    inprogress = false;
+    printf("Copy_result \trep_movsb\t Chunk_size %llu KB\t Time: %llu ms\t Bandwidth: %llu MB/s\n", k_kb, avx_last_copy_time_ns / 1000000, avx_last_bandwidth_mbps);
+}
+
+static void perform_random_copy_avx_cpy(void)
+{
+    unsigned long total_size = GB_TO_BYTES(n_gb);
+    unsigned long chunk_size = KB_TO_BYTES(k_kb);
+    unsigned long num_chunks = total_size / chunk_size;
+    unsigned long *chunk_order;
+    unsigned long i;
+    struct timespec t1;
+    unsigned long start_time, end_time;
+
+    printf("Random copy started \n");
+
+    inprogress = true;
+
+    // Allocate array for random chunk order
+    chunk_order = (unsigned long *)malloc(sizeof(unsigned long) * num_chunks);
+    if (!chunk_order)
+    {
+        printf("Failed to allocate chunk order array\n");
+        return;
+    }
+
+    // Initialize chunk order
+    for (i = 0; i < num_chunks; i++)
+    {
+        chunk_order[i] = i;
+    }
+
+    // Shuffle chunk order
+    for (i = num_chunks - 1; i > 0; i--)
+    {
+        unsigned long j = rand() % (i + 1);
+        unsigned long temp = chunk_order[i];
+        chunk_order[i] = chunk_order[j];
+        chunk_order[j] = temp;
+    }
+
+    // Start timing
+    clock_gettime(CLOCK_REALTIME, &t1);
+    start_time = t1.tv_sec * 1000000000 + t1.tv_nsec;
+    // Perform copies in random order
+    for (i = 0; i < num_chunks; i++)
+    {
+        unsigned long offset = chunk_order[i] * chunk_size;
+        _avx_cpy(array2 + offset, array1 + offset, chunk_size);
+    }
+    // End timing
+    clock_gettime(CLOCK_REALTIME, &t1);
+    end_time = t1.tv_sec * 1000000000 + t1.tv_nsec;
+    ;
+
+    // Calculate time taken and bandwidth
+    avx_last_copy_time_ns = end_time - start_time;
+
+    // Calculate bandwidth in MB/s
+    // total_size in bytes / time in seconds = bytes per second
+    // Convert to MB/s by dividing by 1024*1024
+    avx_last_bandwidth_mbps = (unsigned long)total_size * 1000000000ULL / avx_last_copy_time_ns;
+    avx_last_bandwidth_mbps = avx_last_bandwidth_mbps / (1024 * 1024);
+
+    free(chunk_order);
+    if (verify_copy() != true)
+    {
+        printf("Random copy verification failed  ns\n");
+        // avx_last_bandwidth_mbps = 99999999999;
+    }
+    inprogress = false;
+    printf("Copy_result \t_avx_cpy\t Chunk_size %llu KB\t Time: %llu ms\t Bandwidth: %llu MB/s\n", k_kb, avx_last_copy_time_ns / 1000000, avx_last_bandwidth_mbps);
+}
+
+static void perform_random_copy_avx_async_cpy(void)
+{
+    unsigned long total_size = GB_TO_BYTES(n_gb);
+    unsigned long chunk_size = KB_TO_BYTES(k_kb);
+    unsigned long num_chunks = total_size / chunk_size;
+    unsigned long *chunk_order;
+    unsigned long i;
+    struct timespec t1;
+    unsigned long start_time, end_time;
+
+    printf("Random copy started \n");
+
+    inprogress = true;
+
+    // Allocate array for random chunk order
+    chunk_order = (unsigned long *)malloc(sizeof(unsigned long) * num_chunks);
+    if (!chunk_order)
+    {
+        printf("Failed to allocate chunk order array\n");
+        return;
+    }
+
+    // Initialize chunk order
+    for (i = 0; i < num_chunks; i++)
+    {
+        chunk_order[i] = i;
+    }
+
+    // Shuffle chunk order
+    for (i = num_chunks - 1; i > 0; i--)
+    {
+        unsigned long j = rand() % (i + 1);
+        unsigned long temp = chunk_order[i];
+        chunk_order[i] = chunk_order[j];
+        chunk_order[j] = temp;
+    }
+
+    // Start timing
+    clock_gettime(CLOCK_REALTIME, &t1);
+    start_time = t1.tv_sec * 1000000000 + t1.tv_nsec;
+    // Perform copies in random order
+    for (i = 0; i < num_chunks; i++)
+    {
+        unsigned long offset = chunk_order[i] * chunk_size;
+        _avx_async_cpy(array2 + offset, array1 + offset, chunk_size);
+    }
+    // End timing
+    clock_gettime(CLOCK_REALTIME, &t1);
+    end_time = t1.tv_sec * 1000000000 + t1.tv_nsec;
+    ;
+
+    // Calculate time taken and bandwidth
+    avx_last_copy_time_ns = end_time - start_time;
+
+    // Calculate bandwidth in MB/s
+    // total_size in bytes / time in seconds = bytes per second
+    // Convert to MB/s by dividing by 1024*1024
+    avx_last_bandwidth_mbps = (unsigned long)total_size * 1000000000ULL / avx_last_copy_time_ns;
+    avx_last_bandwidth_mbps = avx_last_bandwidth_mbps / (1024 * 1024);
+
+    free(chunk_order);
+    if (verify_copy() != true)
+    {
+        printf("Random copy verification failed  ns\n");
+        // avx_last_bandwidth_mbps = 99999999999;
+    }
+    inprogress = false;
+    printf("Copy_result \t_avx_async_cpy\t Chunk_size %llu KB\t Time: %llu ms\t Bandwidth: %llu MB/s\n", k_kb, avx_last_copy_time_ns / 1000000, avx_last_bandwidth_mbps);
+}
+
+static void perform_random_copy_avx_async_pf_cpy(void)
+{
+    unsigned long total_size = GB_TO_BYTES(n_gb);
+    unsigned long chunk_size = KB_TO_BYTES(k_kb);
+    unsigned long num_chunks = total_size / chunk_size;
+    unsigned long *chunk_order;
+    unsigned long i;
+    struct timespec t1;
+    unsigned long start_time, end_time;
+
+    printf("Random copy started \n");
+
+    inprogress = true;
+
+    // Allocate array for random chunk order
+    chunk_order = (unsigned long *)malloc(sizeof(unsigned long) * num_chunks);
+    if (!chunk_order)
+    {
+        printf("Failed to allocate chunk order array\n");
+        return;
+    }
+
+    // Initialize chunk order
+    for (i = 0; i < num_chunks; i++)
+    {
+        chunk_order[i] = i;
+    }
+
+    // Shuffle chunk order
+    for (i = num_chunks - 1; i > 0; i--)
+    {
+        unsigned long j = rand() % (i + 1);
+        unsigned long temp = chunk_order[i];
+        chunk_order[i] = chunk_order[j];
+        chunk_order[j] = temp;
+    }
+
+    // Start timing
+    clock_gettime(CLOCK_REALTIME, &t1);
+    start_time = t1.tv_sec * 1000000000 + t1.tv_nsec;
+    // Perform copies in random order
+    for (i = 0; i < num_chunks; i++)
+    {
+        unsigned long offset = chunk_order[i] * chunk_size;
+        _avx_async_pf_cpy(array2 + offset, array1 + offset, chunk_size);
+    }
+    // End timing
+    clock_gettime(CLOCK_REALTIME, &t1);
+    end_time = t1.tv_sec * 1000000000 + t1.tv_nsec;
+    ;
+
+    // Calculate time taken and bandwidth
+    avx_last_copy_time_ns = end_time - start_time;
+
+    // Calculate bandwidth in MB/s
+    // total_size in bytes / time in seconds = bytes per second
+    // Convert to MB/s by dividing by 1024*1024
+    avx_last_bandwidth_mbps = (unsigned long)total_size * 1000000000ULL / avx_last_copy_time_ns;
+    avx_last_bandwidth_mbps = avx_last_bandwidth_mbps / (1024 * 1024);
+
+    free(chunk_order);
+    if (verify_copy() != true)
+    {
+        printf("Random copy verification failed  ns\n");
+        // avx_last_bandwidth_mbps = 99999999999;
+    }
+    inprogress = false;
+    printf("Copy_result \t_avx_async_pf_cpy\t Chunk_size %llu KB\t Time: %llu ms\t Bandwidth: %llu MB/s\n", k_kb, avx_last_copy_time_ns / 1000000, avx_last_bandwidth_mbps);
+}
+
+static void perform_random_copy_avx_cpy_unroll(void)
+{
+    unsigned long total_size = GB_TO_BYTES(n_gb);
+    unsigned long chunk_size = KB_TO_BYTES(k_kb);
+    unsigned long num_chunks = total_size / chunk_size;
+    unsigned long *chunk_order;
+    unsigned long i;
+    struct timespec t1;
+    unsigned long start_time, end_time;
+
+    printf("Random copy started \n");
+
+    inprogress = true;
+
+    // Allocate array for random chunk order
+    chunk_order = (unsigned long *)malloc(sizeof(unsigned long) * num_chunks);
+    if (!chunk_order)
+    {
+        printf("Failed to allocate chunk order array\n");
+        return;
+    }
+
+    // Initialize chunk order
+    for (i = 0; i < num_chunks; i++)
+    {
+        chunk_order[i] = i;
+    }
+
+    // Shuffle chunk order
+    for (i = num_chunks - 1; i > 0; i--)
+    {
+        unsigned long j = rand() % (i + 1);
+        unsigned long temp = chunk_order[i];
+        chunk_order[i] = chunk_order[j];
+        chunk_order[j] = temp;
+    }
+
+    // Start timing
+    clock_gettime(CLOCK_REALTIME, &t1);
+    start_time = t1.tv_sec * 1000000000 + t1.tv_nsec;
+    // Perform copies in random order
+    for (i = 0; i < num_chunks; i++)
+    {
+        unsigned long offset = chunk_order[i] * chunk_size;
+        _avx_cpy_unroll(array2 + offset, array1 + offset, chunk_size);
+    }
+    // End timing
+    clock_gettime(CLOCK_REALTIME, &t1);
+    end_time = t1.tv_sec * 1000000000 + t1.tv_nsec;
+    ;
+
+    // Calculate time taken and bandwidth
+    avx_last_copy_time_ns = end_time - start_time;
+
+    // Calculate bandwidth in MB/s
+    // total_size in bytes / time in seconds = bytes per second
+    // Convert to MB/s by dividing by 1024*1024
+    avx_last_bandwidth_mbps = (unsigned long)total_size * 1000000000ULL / avx_last_copy_time_ns;
+    avx_last_bandwidth_mbps = avx_last_bandwidth_mbps / (1024 * 1024);
+
+    free(chunk_order);
+    if (verify_copy() != true)
+    {
+        printf("Random copy verification failed  ns\n");
+        // avx_last_bandwidth_mbps = 99999999999;
+    }
+    inprogress = false;
+    printf("Copy_result \t_avx_cpy_unroll\t Chunk_size %llu KB\t Time: %llu ms\t Bandwidth: %llu MB/s\n", k_kb, avx_last_copy_time_ns / 1000000, avx_last_bandwidth_mbps);
+}
+
+static void perform_random_copy_avx_async_pf_cpy_unroll(void)
+{
+    unsigned long total_size = GB_TO_BYTES(n_gb);
+    unsigned long chunk_size = KB_TO_BYTES(k_kb);
+    unsigned long num_chunks = total_size / chunk_size;
+    unsigned long *chunk_order;
+    unsigned long i;
+    struct timespec t1;
+    unsigned long start_time, end_time;
+
+    printf("Random copy started \n");
+
+    inprogress = true;
+
+    // Allocate array for random chunk order
+    chunk_order = (unsigned long *)malloc(sizeof(unsigned long) * num_chunks);
+    if (!chunk_order)
+    {
+        printf("Failed to allocate chunk order array\n");
+        return;
+    }
+
+    // Initialize chunk order
+    for (i = 0; i < num_chunks; i++)
+    {
+        chunk_order[i] = i;
+    }
+
+    // Shuffle chunk order
+    for (i = num_chunks - 1; i > 0; i--)
+    {
+        unsigned long j = rand() % (i + 1);
+        unsigned long temp = chunk_order[i];
+        chunk_order[i] = chunk_order[j];
+        chunk_order[j] = temp;
+    }
+
+    // Start timing
+    clock_gettime(CLOCK_REALTIME, &t1);
+    start_time = t1.tv_sec * 1000000000 + t1.tv_nsec;
+    // Perform copies in random order
+    for (i = 0; i < num_chunks; i++)
+    {
+        unsigned long offset = chunk_order[i] * chunk_size;
+        _avx_async_pf_cpy_unroll(array2 + offset, array1 + offset, chunk_size);
+    }
+    // End timing
+    clock_gettime(CLOCK_REALTIME, &t1);
+    end_time = t1.tv_sec * 1000000000 + t1.tv_nsec;
+    ;
+
+    // Calculate time taken and bandwidth
+    avx_last_copy_time_ns = end_time - start_time;
+
+    // Calculate bandwidth in MB/s
+    // total_size in bytes / time in seconds = bytes per second
+    // Convert to MB/s by dividing by 1024*1024
+    avx_last_bandwidth_mbps = (unsigned long)total_size * 1000000000ULL / avx_last_copy_time_ns;
+    avx_last_bandwidth_mbps = avx_last_bandwidth_mbps / (1024 * 1024);
+
+    free(chunk_order);
+    if (verify_copy() != true)
+    {
+        printf("Random copy verification failed  ns\n");
+        // avx_last_bandwidth_mbps = 99999999999;
+    }
+    inprogress = false;
+    printf("Copy_result \t_avx_async_pf_cpy_unroll\t Chunk_size %llu KB\t Time: %llu ms\t Bandwidth: %llu MB/s\n", k_kb, avx_last_copy_time_ns / 1000000, avx_last_bandwidth_mbps);
+}
+
+static void perform_random_copy_memcpy(void)
 {
     unsigned long total_size = GB_TO_BYTES(n_gb);
     unsigned long chunk_size = KB_TO_BYTES(k_kb);
@@ -496,7 +1075,7 @@ static void perform_random_copy_string(void)
     printf("Random copy string started \n");
 
     // Allocate array for random chunk order
-    chunk_order = malloc(sizeof(unsigned long) * num_chunks);
+    chunk_order = (unsigned long *)malloc(sizeof(unsigned long) * num_chunks);
     if (!chunk_order)
     {
         printf("Failed to allocate chunk order array\n");
@@ -550,32 +1129,88 @@ static void perform_random_copy_string(void)
         // string_last_bandwidth_mbps = 99999999999;
     }
     inprogress = false;
-    printf("Copy_result \tSTR\t Chunk_size %llu KB\t Time: %llu ms\t Bandwidth: %llu MB/s\n", k_kb, string_last_copy_time_ns / 1000000, string_last_bandwidth_mbps);
+    printf("Copy_result \tMEMCPY\t Chunk_size %llu KB\t Time: %llu ms\t Bandwidth: %llu MB/s\n", k_kb, string_last_copy_time_ns / 1000000, string_last_bandwidth_mbps);
 }
 
 int main(void)
 {
     unsigned long chunk_size_kb = 1;
-    printf("Copy_mod Memory copy module loading\n");
-    for (chunk_size_kb = 1; chunk_size_kb < 1024 * 8; chunk_size_kb *= 2)
+    printf("copy rte_avx");
+    for (chunk_size_kb = 1; chunk_size_kb < 512; chunk_size_kb *= 2)
     {
         k_kb = chunk_size_kb;
         if (allocate_and_initialize_arrays() == 0)
         {
             perform_random_copy_avx();
         }
+    }
+    printf("copy string");
+    for (chunk_size_kb = 1; chunk_size_kb < 512; chunk_size_kb *= 2)
+    {
+        k_kb = chunk_size_kb;
         if (allocate_and_initialize_arrays() == 0)
         {
-            perform_random_copy_string();
+            perform_random_copy_memcpy();
         }
     }
-    printf("In progress: %s, Verified: %s \n"
-           "AVX: Time ms %llu, Bandwidth MBps %llu\n"
-           "String: Time ms %llu, Bandwidth MBps %llu\n",
-           inprogress ? "yes" : "no", verified ? "yes" : "no",
-           avx_last_copy_time_ns / 1000000, avx_last_bandwidth_mbps,
-           string_last_copy_time_ns / 1000000, string_last_bandwidth_mbps);
+    printf("copy rep_movsb");
+    for (chunk_size_kb = 1; chunk_size_kb < 512; chunk_size_kb *= 2)
+    {
+        k_kb = chunk_size_kb;
+        if (allocate_and_initialize_arrays() == 0)
+        {
+            perform_random_copy_rep_movsb();
+        }
+    }
+    for (chunk_size_kb = 1; chunk_size_kb < 512; chunk_size_kb *= 2)
+    {
+        k_kb = chunk_size_kb;
+        if (allocate_and_initialize_arrays() == 0)
+        {
+            perform_random_copy_avx_cpy();
+        }
+    }
+    for (chunk_size_kb = 1; chunk_size_kb < 512; chunk_size_kb *= 2)
+    {
+        k_kb = chunk_size_kb;
+        if (allocate_and_initialize_arrays() == 0)
+        {
+            perform_random_copy_avx_async_cpy();
+        }
+    }
+    for (chunk_size_kb = 1; chunk_size_kb < 512; chunk_size_kb *= 2)
+    {
+        k_kb = chunk_size_kb;
+        if (allocate_and_initialize_arrays() == 0)
+        {
+            perform_random_copy_avx_async_pf_cpy();
+        }
+    }
+    for (chunk_size_kb = 1; chunk_size_kb < 512; chunk_size_kb *= 2)
+    {
+        k_kb = chunk_size_kb;
+        if (allocate_and_initialize_arrays() == 0)
+        {
+            perform_random_copy_avx_cpy_unroll();
+        }
+    }
+    for (chunk_size_kb = 1; chunk_size_kb < 512; chunk_size_kb *= 2)
+    {
+        k_kb = chunk_size_kb;
+        if (allocate_and_initialize_arrays() == 0)
+        {
+            perform_random_copy_avx_cpy_unroll();
+        }
+    }
+    for (chunk_size_kb = 1; chunk_size_kb < 512; chunk_size_kb *= 2)
+    {
+        k_kb = chunk_size_kb;
+        if (allocate_and_initialize_arrays() == 0)
+        {
+            perform_random_copy_avx_async_pf_cpy_unroll();
+        }
+    }
 
-    printf("Memory copy module loaded\n");
+    printf("Memory copy suit finished\n");
     return 0;
 }
