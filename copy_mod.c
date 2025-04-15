@@ -59,7 +59,7 @@ rte_mov15_or_less(void *dst, const void *src, size_t n)
      * Use the following structs to avoid violating C standard
      * alignment requirements and to avoid strict aliasing bugs
      */
-    copy_user_enhanced_fast_string(dst, src, n);
+    copy_user_generic(dst, src, n);
     return dst;
 }
 
@@ -70,7 +70,7 @@ rte_mov15_or_less(void *dst, const void *src, size_t n)
 static inline void
 rte_mov16(uint8_t *dst, const uint8_t *src)
 {
-    copy_user_enhanced_fast_string(dst, src, 16);
+    copy_user_generic(dst, src, 16);
 }
 
 /**
@@ -572,7 +572,7 @@ static void perform_random_copy_string(void)
     for (i = 0; i < num_chunks; i++)
     {
         unsigned long offset = chunk_order[i] * chunk_size;
-        copy_user_enhanced_fast_string(array2 + offset, array1 + offset, chunk_size);
+        copy_user_generic(array2 + offset, array1 + offset, chunk_size);
         pr_debug("Copied chunk %lu/%lu\n", i + 1, num_chunks);
     }
 

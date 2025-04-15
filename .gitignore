@@ -2,3 +2,5 @@
 *.ko
 *.tmp_versions
 *.o
+*.o.d
+copy_user

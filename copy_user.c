@@ -2,10 +2,16 @@
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdbool.h>
+#include <string.h>
 #include <time.h>
 #include <string.h>
 #include <immintrin.h>
+#include "x86intrin.h"
 #include <sys/mman.h>
+#include <linux/idxd.h>
+#include <errno.h>
+#include <unistd.h>
+#include <fcntl.h>
 
 #include <cstdlib>
 #include <thread>
@@ -24,6 +30,14 @@ static unsigned long string_last_bandwidth_mbps; // Store last bandwidth in MB/s
 
 static bool inprogress = false;
 static bool verified = true;
+
+static void *dsa_wq = MAP_FAILED;
+static int dedicated_mode = 0;
+static int max_retry_count = 10000;
+static int resubmit_copy_retry = 8;
+static int top_retry_count;
+
+#define DSA_WQ_SIZE 4096
 
 #define GB_TO_BYTES(x) ((unsigned long)(x) << 30)
 #define KB_TO_BYTES(x) ((unsigned long)(x) << 10)
@@ -1132,9 +1146,245 @@ static void perform_random_copy_memcpy(void)
     printf("Copy_result \tMEMCPY\t Chunk_size %llu KB\t Time: %llu ms\t Bandwidth: %llu MB/s\n", k_kb, string_last_copy_time_ns / 1000000, string_last_bandwidth_mbps);
 }
 
+static inline unsigned int
+enqcmd(void *dst, const void *src)
+{
+    uint8_t retry;
+    asm volatile(".byte 0xf2, 0x0f, 0x38, 0xf8, 0x02\t\n"
+                 "setz %0\t\n"
+                 : "=r"(retry) : "a"(dst), "d"(src));
+    return (unsigned int)retry;
+}
+
+static void *map_dsa_device(const char *dsa_wq_path)
+{
+    void *dsa_device;
+    int fd;
+
+    fd = open(dsa_wq_path, O_RDWR);
+    if (fd < 0)
+    {
+        printf("open %s failed with errno = %d.\n",
+               dsa_wq_path, errno);
+        return MAP_FAILED;
+    }
+    dsa_device = mmap(NULL, DSA_WQ_SIZE, PROT_WRITE,
+                      MAP_SHARED | MAP_POPULATE, fd, 0);
+    close(fd);
+    if (dsa_device == MAP_FAILED)
+    {
+        printf("mmap failed with errno = %d.\n", errno);
+        return MAP_FAILED;
+    }
+    return dsa_device;
+}
+
+static int submit_wi(void *wq, void *descriptor)
+{
+    int retry = 0;
+
+    _mm_sfence();
+
+    if (dedicated_mode)
+    {
+        _movdir64b(dsa_wq, descriptor);
+    }
+    else
+    {
+        while (1)
+        {
+            if (enqcmd(dsa_wq, descriptor) == 0)
+            {
+                break;
+            }
+            retry++;
+            if (retry > max_retry_count)
+            {
+                printf("Submit work retry %d times.\n", retry);
+                exit(1);
+            }
+        }
+    }
+
+    return 0;
+}
+
+static int poll_completion(struct dsa_completion_record *completion,
+                           enum dsa_opcode opcode)
+{
+    int retry = 0;
+
+    while (1)
+    {
+        if (completion->status != DSA_COMP_NONE)
+        {
+            /* TODO: Error handling here. */
+            if (completion->status != DSA_COMP_SUCCESS &&
+                completion->status != DSA_COMP_PAGE_FAULT_NOBOF)
+            {
+                printf("DSA opcode %d failed with status = %d.\n",
+                       opcode, completion->status);
+                return 1;
+            }
+            break;
+        }
+        retry++;
+        if (retry > max_retry_count)
+        {
+            printf("Wait for completion retry %d times.\n", retry);
+            return 1;
+        }
+        _mm_pause();
+    }
+
+    if (retry > top_retry_count)
+    {
+        top_retry_count = retry;
+    }
+
+    return 0;
+}
+
+static void copy_dsa(void *src, void *dst, size_t len)
+{
+    struct dsa_completion_record completion __attribute__((aligned(32)));
+    struct dsa_hw_desc descriptor;
+    uint8_t test_byte;
+
+    memset(&completion, 0, sizeof(completion));
+    memset(&descriptor, 0, sizeof(descriptor));
+
+    descriptor.opcode = DSA_OPCODE_MEMMOVE;
+    descriptor.flags = IDXD_OP_FLAG_RCR | IDXD_OP_FLAG_CRAV;
+    descriptor.xfer_size = len;
+    descriptor.src_addr = (uintptr_t)src;
+    descriptor.dst_addr = (uintptr_t)dst;
+    completion.status = 0;
+    descriptor.completion_addr = (uint64_t)&completion;
+
+    // printf("Submitting work to DSA work queue.....\n");
+
+    for (int i = 0; i < resubmit_copy_retry; i++)
+    {
+        submit_wi(dsa_wq, &descriptor);
+        // printf("Polling for completion.....\n");
+        poll_completion(&completion, DSA_OPCODE_COMPARE);
+
+        if (completion.status == DSA_COMP_SUCCESS)
+        {
+            // printf("DSA operation completed!\n");
+            return;
+        }
+    }
+
+    printf("DSA COPY FAILED...\n");
+    exit(1);
+}
+
+void dsa_cleanup(void)
+{
+    if (dsa_wq != MAP_FAILED)
+    {
+        munmap(dsa_wq, DSA_WQ_SIZE);
+    }
+}
+
+static void perform_random_copy_dsa(void)
+{
+    unsigned long total_size = GB_TO_BYTES(n_gb);
+    unsigned long chunk_size = KB_TO_BYTES(k_kb);
+    unsigned long num_chunks = total_size / chunk_size;
+    unsigned long *chunk_order;
+    char *dsa_path = "/dev/dsa/wq0.1";
+
+    unsigned long i;
+    unsigned long start_time, end_time;
+    struct timespec t1;
+
+    inprogress = true;
+
+    printf("Configuring DSA......\n");
+    dsa_wq = map_dsa_device(dsa_path);
+    if (dsa_wq == MAP_FAILED)
+    {
+        printf("map_dsa_device failed MAP_FAILED\n");
+        return;
+    }
+
+    printf("Configured work queue.\n");
+
+    printf("Random copy string started \n");
+
+    // Allocate array for random chunk order
+    chunk_order = (unsigned long *)malloc(sizeof(unsigned long) * num_chunks);
+    if (!chunk_order)
+    {
+        printf("Failed to allocate chunk order array\n");
+        return;
+    }
+
+    // Initialize chunk order
+    for (i = 0; i < num_chunks; i++)
+    {
+        chunk_order[i] = i;
+    }
+
+    // Shuffle chunk order
+    for (i = num_chunks - 1; i > 0; i--)
+    {
+        unsigned long j = rand() % (i + 1);
+        unsigned long temp = chunk_order[i];
+        chunk_order[i] = chunk_order[j];
+        chunk_order[j] = temp;
+    }
+
+    // Start timing
+    clock_gettime(CLOCK_REALTIME, &t1);
+    start_time = t1.tv_sec * 1000000000 + t1.tv_nsec;
+
+    // Perform copies in random order
+    for (i = 0; i < num_chunks; i++)
+    {
+        unsigned long offset = chunk_order[i] * chunk_size;
+        copy_dsa(array2 + offset, array1 + offset, chunk_size);
+    }
+
+    // End timing
+    clock_gettime(CLOCK_REALTIME, &t1);
+    end_time = t1.tv_sec * 1000000000 + t1.tv_nsec;
+    ;
+
+    // Calculate time taken and bandwidth
+    string_last_copy_time_ns = end_time - start_time;
+
+    // Calculate bandwidth in MB/s
+    // total_size in bytes / time in seconds = bytes per second
+    // Convert to MB/s by dividing by 1024*1024
+    string_last_bandwidth_mbps = (unsigned long)total_size * 1000000000ULL / string_last_copy_time_ns;
+    string_last_bandwidth_mbps = string_last_bandwidth_mbps / (1024 * 1024);
+
+    free(chunk_order);
+    if (verify_copy() != true)
+    {
+        printf("Random copy verification failed  ns\n");
+        // string_last_bandwidth_mbps = 99999999999;
+    }
+    inprogress = false;
+    printf("Copy_result \tDSA\t Chunk_size %llu KB\t Time: %llu ms\t Bandwidth: %llu MB/s\n", k_kb, string_last_copy_time_ns / 1000000, string_last_bandwidth_mbps);
+}
+
 int main(void)
 {
     unsigned long chunk_size_kb = 1;
+    printf("copy dsa");
+    for (chunk_size_kb = 1; chunk_size_kb < 4096; chunk_size_kb *= 2)
+    {
+        k_kb = chunk_size_kb;
+        if (allocate_and_initialize_arrays() == 0)
+        {
+            perform_random_copy_dsa();
+        }
+    }
     printf("copy rte_avx");
     for (chunk_size_kb = 1; chunk_size_kb < 512; chunk_size_kb *= 2)
     {
