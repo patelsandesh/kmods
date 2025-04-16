@@ -7,7 +7,7 @@
 
 static void *dsa_wq = MAP_FAILED;
 static int dedicated_mode = 0;
-static int max_retry_count = 10000;
+static int max_retry_count = 1000000;
 static int resubmit_copy_retry = 8;
 static int top_retry_count;
 
