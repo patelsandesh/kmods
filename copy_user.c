@@ -118,7 +118,7 @@ static int verify_copy(void)
 
 static void configure_dsa(void)
 {
-    char *dsa_path = "/dev/dsa/wq0.1";
+    const char *dsa_path = "/dev/dsa/wq0.1";
     printf("Configuring DSA......\n");
     dsa_wq = map_dsa_device(dsa_path);
     if (dsa_wq == MAP_FAILED)
@@ -175,7 +175,7 @@ static void copy_driver(copy_func_t copy_func)
         for (i = 0; i < num_chunks; i++)
         {
             unsigned long offset = chunk_order[i] * chunk_size;
-            copy_func(array2 + offset, array1 + offset, chunk_size);
+            copy_func((char *)array2 + offset, (char *)array1 + offset, chunk_size);
         }
         // End timing
         clock_gettime(CLOCK_REALTIME, &t1);
@@ -196,7 +196,7 @@ static void copy_driver(copy_func_t copy_func)
             printf("Random copy verification failed  ns\n");
             // avx_last_bandwidth_mbps = 99999999999;
         }
-        printf("%llu KB\t\t%llu ms\t\t%llu MB/s\n", chunk_size / KB, last_copy_time_ns / 1000000, last_bandwidth_mbps);
+        printf("%lu KB\t\t%lu ms\t\t%lu MB/s\n", chunk_size / KB, last_copy_time_ns / 1000000, last_bandwidth_mbps);
     }
 }
 
@@ -204,10 +204,10 @@ int main(void)
 {
     allocate_and_initialize_arrays();
     configure_dsa();
+    COPY_USING(_rep_movsb);
     COPY_USING(copy_dsa);
     COPY_USING(rte_memcpy);
     COPY_USING(memcpy);
-    COPY_USING(_rep_movsb);
     COPY_USING(_avx_cpy);
     COPY_USING(_avx_async_cpy);
     COPY_USING(_avx_async_pf_cpy);

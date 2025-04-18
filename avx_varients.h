@@ -1,10 +1,16 @@
 
 static inline void * _rep_movsb(void *d, const void *s, size_t n)
 {
-    asm volatile("rep movsb"
-                 : "=D"(d), "=S"(s), "=c"(n)
-                 : "0"(d), "1"(s), "2"(n)
-                 : "memory");
+    __asm__ __volatile__ (
+        "mov %0, %%rdi\n"    // Destination address to RDI
+        "mov %1, %%rsi\n"    // Source address to RSI
+        "mov %2, %%rcx\n"    // Count to RCX
+        "rep movsb"          // REP MOVSB instruction
+        :                    // No output operands
+        : "r" (d), "r" (s), "r" (n)  // Input operands
+        : "rdi", "rsi", "rcx"  // Clobbered registers
+    );
+    return NULL;
 }
 
 static inline void * _avx_cpy(void *d, const void *s, size_t n)
@@ -20,6 +26,7 @@ static inline void * _avx_cpy(void *d, const void *s, size_t n)
         const __m256i temp = _mm256_load_si256(sVec);
         _mm256_store_si256(dVec, temp);
     }
+    return NULL;
 }
 
 static inline void * _avx_async_cpy(void *d, const void *s, size_t n)
@@ -36,6 +43,7 @@ static inline void * _avx_async_cpy(void *d, const void *s, size_t n)
         _mm256_stream_si256(dVec, temp);
     }
     _mm_sfence();
+    return NULL;
 }
 
 static inline void * _avx_async_pf_cpy(void *d, const void *s, size_t n)
@@ -58,6 +66,7 @@ static inline void * _avx_async_pf_cpy(void *d, const void *s, size_t n)
     _mm256_stream_si256(dVec, _mm256_load_si256(sVec));
     _mm256_stream_si256(dVec + 1, _mm256_load_si256(sVec + 1));
     _mm_sfence();
+    return NULL;
 }
 
 static inline void * _avx_cpy_unroll(void *d, const void *s, size_t n)
@@ -75,6 +84,7 @@ static inline void * _avx_cpy_unroll(void *d, const void *s, size_t n)
         _mm256_store_si256(dVec + 2, _mm256_load_si256(sVec + 2));
         _mm256_store_si256(dVec + 3, _mm256_load_si256(sVec + 3));
     }
+    return NULL;
 }
 
 static inline void * _avx_async_cpy_unroll(void *d, const void *s, size_t n)
@@ -93,6 +103,7 @@ static inline void * _avx_async_cpy_unroll(void *d, const void *s, size_t n)
         _mm256_stream_si256(dVec + 3, _mm256_stream_load_si256(sVec + 3));
     }
     _mm_sfence();
+    return NULL;
 }
 
 static inline void * _avx_async_pf_cpy_unroll(void *d, const void *s, size_t n)
@@ -118,4 +129,5 @@ static inline void * _avx_async_pf_cpy_unroll(void *d, const void *s, size_t n)
     _mm256_stream_si256(dVec + 2, _mm256_load_si256(sVec + 2));
     _mm256_stream_si256(dVec + 3, _mm256_load_si256(sVec + 3));
     _mm_sfence();
+    return NULL;
 }

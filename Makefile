@@ -1,6 +1,6 @@
-obj-m += copy_mod.o
+obj-m += dma_mod.o
 
-all: user
+all: user module
 
 module:
 	make -C /lib/modules/$(shell uname -r)/build M=$(PWD) modules
